@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -70,12 +71,20 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
+	prevSoftState SoftState
+	prevHardState pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	return nil, nil
+	r := newRaft(config)
+	rn := &RawNode{
+		Raft:          r,
+		prevSoftState: SoftState{Lead: r.Lead, RaftState: r.State},
+		prevHardState: r.hardState(),
+	}
+	return rn, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -143,19 +152,105 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	return Ready{}
+	r := rn.Raft
+	rd := Ready{
+		Entries:          r.RaftLog.unstableEntries(),
+		CommittedEntries: r.RaftLog.nextEnts(),
+		Messages:         r.msgs,
+	}
+
+	// 只有状态变化了才设置 SoftState
+	softState := SoftState{RaftState: r.State, Lead: r.Lead}
+	if softState != rn.prevSoftState {
+		rd.SoftState = &softState
+	}
+
+	// 只有状态变化了才设置 HardState
+	hardState := r.hardState()
+	if !isHardStateEqual(hardState, rn.prevHardState) {
+		rd.HardState = hardState
+	}
+
+	if r.RaftLog.pendingSnapshot != nil {
+		rd.Snapshot = *r.RaftLog.pendingSnapshot
+	}
+
+	log.Debugf("Ready: SoftState=%v, HardState=%v, Entries=%d, CommittedEntries=%d, Messages=%d",
+		rd.SoftState, rd.HardState, len(rd.Entries), len(rd.CommittedEntries), len(rd.Messages))
+	return rd
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
-	// Your Code Here (2A).
+	r := rn.Raft
+
+	// 检查 SoftState 是否改变
+	if rn.prevSoftState.Lead != r.Lead || rn.prevSoftState.RaftState != r.State {
+		return true
+	}
+
+	// 检查 HardState 是否改变
+	if !isHardStateEqual(rn.prevHardState, r.hardState()) {
+		return true
+	}
+
+	// 检查是否有未持久化日志
+	if len(r.RaftLog.unstableEntries()) > 0 {
+		return true
+	}
+
+	// 检查是否有待应用日志
+	if len(r.RaftLog.nextEnts()) > 0 {
+		return true
+	}
+
+	// 检查是否有待发送消息
+	if len(r.msgs) > 0 {
+		return true
+	}
+
+	// 检查是否有快照（2C 才需要）
+	if r.RaftLog.pendingSnapshot != nil {
+		return true
+	}
+
 	return false
 }
 
-// Advance notifies the RawNode that the application has applied and saved progress in the
-// last Ready results.
+// Advance notifies the RawNode that the application has applied and saved progress in the last Ready results.
+// The application should call Advance to update the RawNode internal state and progress.
 func (rn *RawNode) Advance(rd Ready) {
-	// Your Code Here (2A).
+	r := rn.Raft
+
+	// 1. 更新 prevSoftState
+	if rd.SoftState != nil {
+		rn.prevSoftState = *rd.SoftState
+	}
+
+	// 2. 更新 prevHardState
+	if !IsEmptyHardState(rd.HardState) {
+		rn.prevHardState = rd.HardState
+	}
+
+	// 3. 更新 applied 索引
+	if len(rd.CommittedEntries) > 0 {
+		lastApplied := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+		r.RaftLog.applied = lastApplied
+	}
+
+	// 4. 更新 stabled 索引
+	if len(rd.Entries) > 0 {
+		lastStabled := rd.Entries[len(rd.Entries)-1].Index
+		r.RaftLog.stabled = lastStabled
+	}
+
+	// 5. 清空消息队列
+	r.msgs = nil
+
+	// 6. 清空 pendingSnapshot（2C 才需要）
+	if !IsEmptySnap(&rd.Snapshot) {
+		r.RaftLog.pendingSnapshot = nil
+	}
 }
 
 // GetProgress return the Progress of this node and its peers, if this
