@@ -40,8 +40,8 @@ import (
 // 3. Reader()/Write() - Perform operations
 // 4. Stop() - Cleanup and close database
 type StandAloneStorage struct {
-	config *config.Config  // Configuration including DB path
-	db     *badger.DB      // Underlying BadgerDB instance
+	config *config.Config // Configuration including DB path
+	db     *badger.DB     // Underlying BadgerDB instance
 }
 
 // StandAloneReader implements storage.StorageReader interface.
@@ -53,7 +53,7 @@ type StandAloneStorage struct {
 // 2. Perform read operations (GetCF, IterCF)
 // 3. Always call Close() to release resources
 type StandAloneReader struct {
-	txn *badger.Txn  // Read-only transaction for consistent snapshots
+	txn *badger.Txn // Read-only transaction for consistent snapshots
 }
 
 // NewStandAloneStorage creates a new standalone storage instance.
@@ -182,9 +182,9 @@ func (r *StandAloneReader) GetCF(cf string, key []byte) ([]byte, error) {
 	if err != nil {
 		// Handle missing key case
 		if err == badger.ErrKeyNotFound {
-			return nil, nil  // Key doesn't exist - not an error
+			return nil, nil // Key doesn't exist - not an error
 		}
-		return nil, err  // Database error
+		return nil, err // Database error
 	}
 
 	// Get value copy (safe to use outside transaction)
@@ -211,13 +211,14 @@ func (r *StandAloneReader) GetCF(cf string, key []byte) ([]byte, error) {
 //   - Iterator.Key() returns original key (without "default_" prefix)
 //
 // Usage Pattern:
-//   iter := reader.IterCF("default")
-//   defer iter.Close()  // Always close!
-//   for iter.Seek(startKey); iter.Valid(); iter.Next() {
-//       key := iter.Item().Key()
-//       value, err := iter.Item().Value()
-//       // Process key/value...
-//   }
+//
+//	iter := reader.IterCF("default")
+//	defer iter.Close()  // Always close!
+//	for iter.Seek(startKey); iter.Valid(); iter.Next() {
+//	    key := iter.Item().Key()
+//	    value, err := iter.Item().Value()
+//	    // Process key/value...
+//	}
 //
 // Resource Management:
 //   - Caller MUST call Close() when done
@@ -246,12 +247,13 @@ func (r *StandAloneReader) IterCF(cf string) engine_util.DBIterator {
 //   - Best practice: defer reader.Close() immediately after creation
 //
 // Example:
-//   reader, err := storage.Reader(ctx)
-//   if err != nil {
-//       return err
-//   }
-//   defer reader.Close()  // Always close!
-//   // Use reader...
+//
+//	reader, err := storage.Reader(ctx)
+//	if err != nil {
+//	    return err
+//	}
+//	defer reader.Close()  // Always close!
+//	// Use reader...
 func (r *StandAloneReader) Close() {
 	// Discard transaction to release resources
 	// Safe to call multiple times - second call is no-op
@@ -288,15 +290,16 @@ func (r *StandAloneReader) Close() {
 //   - error if transaction cannot be created (rare)
 //
 // Example:
-//   reader, err := storage.Reader(ctx)
-//   if err != nil {
-//       return err
-//   }
-//   defer reader.Close()  // Always close!
 //
-//   value, err := reader.GetCF("default", "key")
-//   iter := reader.IterCF("default")
-//   // Use reader...
+//	reader, err := storage.Reader(ctx)
+//	if err != nil {
+//	    return err
+//	}
+//	defer reader.Close()  // Always close!
+//
+//	value, err := reader.GetCF("default", "key")
+//	iter := reader.IterCF("default")
+//	// Use reader...
 func (s *StandAloneStorage) Reader(ctx *kvrpcpb.Context) (storage.StorageReader, error) {
 	// Create read-only transaction for consistent snapshot
 	// false = read-only, true = writable
@@ -341,11 +344,12 @@ func (s *StandAloneStorage) Reader(ctx *kvrpcpb.Context) (storage.StorageReader,
 //   - Large batches should be chunked for better performance
 //
 // Example:
-//   batch := []storage.Modify{
-//       {Data: storage.Put{Cf: "default", Key: []byte("key1"), Value: []byte("value1")}},
-//       {Data: storage.Delete{Cf: "write", Key: []byte("key2")}},
-//   }
-//   err := storage.Write(ctx, batch)
+//
+//	batch := []storage.Modify{
+//	    {Data: storage.Put{Cf: "default", Key: []byte("key1"), Value: []byte("value1")}},
+//	    {Data: storage.Delete{Cf: "write", Key: []byte("key2")}},
+//	}
+//	err := storage.Write(ctx, batch)
 func (s *StandAloneStorage) Write(ctx *kvrpcpb.Context, batch []storage.Modify) error {
 	return s.db.Update(func(txn *badger.Txn) error {
 		for _, modify := range batch {
