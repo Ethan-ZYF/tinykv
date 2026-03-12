@@ -209,6 +209,10 @@ func (rn *RawNode) HasReady() bool {
 	if len(r.msgs) > 0 {
 		return true
 	}
+	// pending snapshot to handle
+	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
+		return true
+	}
 	return false
 }
 
@@ -232,7 +236,12 @@ func (rn *RawNode) Advance(rd Ready) {
 		e := rd.CommittedEntries[len(rd.CommittedEntries)-1]
 		rn.Raft.RaftLog.applied = e.Index
 	}
-	// 4. 清空 msgs
+
+	// 4. 清空 snapshot
+	rn.Raft.RaftLog.pendingSnapshot = nil
+	rn.Raft.RaftLog.maybeCompact()
+
+	// 5. 清空 msgs
 	rn.Raft.msgs = nil
 }
 

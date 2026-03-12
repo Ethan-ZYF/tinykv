@@ -6,10 +6,13 @@ import (
 
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
@@ -43,6 +46,139 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
+	if !d.RaftGroup.HasReady() {
+		return
+	}
+	rd := d.RaftGroup.Ready()
+	applyResult, err := d.peerStorage.SaveReadyState(&rd)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Update storeMeta if snapshot was applied
+	if applyResult != nil {
+		d.ctx.storeMeta.Lock()
+		d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: applyResult.Region})
+		d.ctx.storeMeta.regions[applyResult.Region.Id] = applyResult.Region
+		d.ctx.storeMeta.Unlock()
+	}
+
+	if len(rd.Messages) != 0 {
+		d.Send(d.ctx.trans, rd.Messages)
+	}
+
+	for _, entry := range rd.CommittedEntries {
+		d.appendEntry(entry)
+	}
+	d.RaftGroup.Advance(rd)
+}
+
+func (d *peerMsgHandler) appendEntry(entry eraftpb.Entry) {
+	if entry.Data == nil {
+		// noop entry from leader election
+		d.peerStorage.applyState.AppliedIndex = entry.Index
+		kvWB := new(engine_util.WriteBatch)
+		kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+		kvWB.WriteToDB(d.ctx.engine.Kv)
+		d.handleProposals(entry, nil)
+		return
+	}
+
+	var msg raft_cmdpb.RaftCmdRequest
+	msg.Unmarshal(entry.Data)
+
+	if msg.AdminRequest != nil {
+		d.applyAdminRequest(entry, &msg)
+		return
+	}
+
+	kvWB := new(engine_util.WriteBatch)
+	resp := newCmdResp()
+	for _, request := range msg.Requests {
+		switch request.CmdType {
+		case raft_cmdpb.CmdType_Invalid:
+		case raft_cmdpb.CmdType_Get:
+			val, err := engine_util.GetCF(d.ctx.engine.Kv, request.Get.GetCf(), request.Get.GetKey())
+			if err != nil {
+				val = nil
+			}
+			resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Get,
+				Get:     &raft_cmdpb.GetResponse{Value: val},
+			})
+		case raft_cmdpb.CmdType_Put:
+			kvWB.SetCF(request.Put.GetCf(), request.Put.GetKey(), request.Put.GetValue())
+			resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Put,
+				Put:     &raft_cmdpb.PutResponse{},
+			})
+		case raft_cmdpb.CmdType_Delete:
+			kvWB.DeleteCF(request.Delete.GetCf(), request.Delete.GetKey())
+			resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Delete,
+				Delete:  &raft_cmdpb.DeleteResponse{},
+			})
+		case raft_cmdpb.CmdType_Snap:
+			resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Snap,
+				Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+			})
+		}
+	}
+	d.peerStorage.applyState.AppliedIndex = entry.Index
+	kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+	kvWB.WriteToDB(d.ctx.engine.Kv)
+
+	d.handleProposals(entry, resp)
+}
+
+func (d *peerMsgHandler) handleProposals(entry eraftpb.Entry, resp *raft_cmdpb.RaftCmdResponse) {
+	for len(d.proposals) > 0 {
+		p := d.proposals[0]
+		if p.index < entry.Index {
+			// Stale proposal, notify and discard
+			if p.cb != nil {
+				NotifyStaleReq(entry.Term, p.cb)
+			}
+			d.proposals = d.proposals[1:]
+			continue
+		}
+		if p.index == entry.Index {
+			if p.term == entry.Term {
+				if p.cb != nil && resp != nil {
+					for _, r := range resp.Responses {
+						if r.CmdType == raft_cmdpb.CmdType_Snap {
+							p.cb.Txn = d.ctx.engine.Kv.NewTransaction(false)
+						}
+					}
+					p.cb.Done(resp)
+				}
+			} else {
+				if p.cb != nil {
+					NotifyStaleReq(entry.Term, p.cb)
+				}
+			}
+			d.proposals = d.proposals[1:]
+		}
+		break
+	}
+}
+
+func (d *peerMsgHandler) applyAdminRequest(entry eraftpb.Entry, msg *raft_cmdpb.RaftCmdRequest) {
+	switch msg.AdminRequest.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		compactLog := msg.AdminRequest.GetCompactLog()
+		if compactLog.CompactIndex >= d.peerStorage.applyState.TruncatedState.Index {
+			d.peerStorage.applyState.TruncatedState.Index = compactLog.CompactIndex
+			d.peerStorage.applyState.TruncatedState.Term = compactLog.CompactTerm
+			d.ScheduleCompactLog(compactLog.CompactIndex)
+		}
+	}
+	d.peerStorage.applyState.AppliedIndex = entry.Index
+	kvWB := new(engine_util.WriteBatch)
+	kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+	kvWB.WriteToDB(d.ctx.engine.Kv)
+	d.handleProposals(entry, nil)
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -110,10 +246,23 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
-		cb.Done(ErrResp(err))
+		if cb != nil {
+			cb.Done(ErrResp(err))
+		}
 		return
 	}
 	// Your Code Here (2B).
+	d.proposals = append(d.proposals, &proposal{
+		term:  d.Term(),
+		index: d.nextProposalIndex(),
+		cb:    cb,
+	})
+
+	data, marErr := msg.Marshal()
+	if marErr != nil {
+		log.Fatal(marErr)
+	}
+	d.RaftGroup.Propose(data)
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -223,9 +372,9 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)

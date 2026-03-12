@@ -88,6 +88,25 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	first, _ := l.storage.FirstIndex()
+	if first > l.FirstIndex() {
+		offset := first - l.FirstIndex()
+		if int(offset) >= len(l.entries) {
+			// All entries have been compacted; keep a dummy at first-1
+			dummyIndex := first - 1
+			dummyTerm, _ := l.storage.Term(dummyIndex)
+			l.entries = []pb.Entry{{Index: dummyIndex, Term: dummyTerm}}
+		} else {
+			l.entries = l.entries[offset:]
+		}
+	}
+}
+
+func (l *RaftLog) Snapshot() (pb.Snapshot, error) {
+	if l.pendingSnapshot != nil {
+		return *l.pendingSnapshot, nil
+	}
+	return l.storage.Snapshot()
 }
 
 // allEntries return all the entries not compacted.
@@ -107,9 +126,13 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 	}
 	offset := l.FirstIndex()
 	if l.stabled+1 < offset {
-		return nil
+		return l.entries[1:] // skip dummy
 	}
-	return l.entries[l.stabled+1-offset:]
+	idx := l.stabled + 1 - offset
+	if idx >= uint64(len(l.entries)) {
+		return make([]pb.Entry, 0)
+	}
+	return l.entries[idx:]
 }
 
 // nextEnts returns all the committed but not applied entries
@@ -117,8 +140,19 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	if len(l.entries) == 0 {
 		return nil
 	}
+	if l.applied >= l.committed {
+		return nil
+	}
 	offset := l.FirstIndex()
-	return l.entries[l.applied+1-offset : l.committed+1-offset]
+	lo := l.applied + 1 - offset
+	hi := l.committed + 1 - offset
+	if lo >= uint64(len(l.entries)) {
+		return nil
+	}
+	if hi > uint64(len(l.entries)) {
+		hi = uint64(len(l.entries))
+	}
+	return l.entries[lo:hi]
 }
 
 // FirstIndex return the first index of the log entries
@@ -155,6 +189,15 @@ func (l *RaftLog) LastIndex() uint64 {
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
+	if !IsEmptySnap(l.pendingSnapshot) {
+		snapIndex := l.pendingSnapshot.Metadata.Index
+		if i == snapIndex {
+			return l.pendingSnapshot.Metadata.Term, nil
+		}
+		if i < snapIndex {
+			return 0, ErrCompacted
+		}
+	}
 	if len(l.entries) > 0 && i >= l.FirstIndex() {
 		if i > l.LastIndex() {
 			return 0, ErrUnavailable
@@ -164,6 +207,9 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	}
 	// entries 里没有，去 storage 找
 	term, err := l.storage.Term(i)
+	if err == ErrUnavailable && !IsEmptySnap(l.pendingSnapshot) {
+		return term, ErrCompacted
+	}
 	return term, err
 }
 

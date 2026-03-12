@@ -170,21 +170,22 @@ func newRaft(c *Config) *Raft {
 	}
 	// Your Code Here (2A).
 	rlog := newLog(c.Storage)
-	rlog.applied = c.Applied
-	raft := &Raft{
-		id:                        c.ID,
-		RaftLog:                   rlog,
-		Prs:                       make(map[uint64]*Progress),
-		heartbeatElapsed:          0,
-		electionElapsed:           0,
-		heartbeatTimeout:          c.HeartbeatTick,
-		electionTimeout:           c.ElectionTick,
-		randomizedElectionTimeout: resetRandomTimeout(c.ElectionTick),
-	}
 	if c.Applied > 0 {
 		rlog.applied = c.Applied
 	}
-	hardState, _, _ := c.Storage.InitialState()
+	raft := &Raft{
+		id:               c.ID,
+		RaftLog:          rlog,
+		Prs:              make(map[uint64]*Progress),
+		heartbeatElapsed: 0,
+		electionElapsed:  0,
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout:  c.ElectionTick,
+	}
+	hardState, confState, _ := c.Storage.InitialState()
+	if c.peers == nil {
+		c.peers = confState.Nodes
+	}
 	for _, peer := range c.peers {
 		raft.Prs[peer] = &Progress{
 			Next:  raft.RaftLog.LastIndex() + 1,
@@ -201,8 +202,19 @@ func newRaft(c *Config) *Raft {
 func (r *Raft) sendAppend(to uint64) bool {
 	prevLogIndex := r.Prs[to].Next - 1
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
-	if err != nil {
-		// 2C 再处理快照
+	if err == ErrCompacted {
+		snapshot, err := r.RaftLog.Snapshot()
+		if err != nil {
+			return false
+		}
+		r.send(
+			pb.Message{
+				MsgType:  pb.MessageType_MsgSnapshot,
+				To:       to,
+				Snapshot: &snapshot,
+			})
+		return true
+	} else if err != nil {
 		return false
 	}
 
@@ -397,6 +409,10 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		r.electionElapsed = 0
 		r.Lead = m.From
 		r.handleHeartbeat(m)
+	case pb.MessageType_MsgSnapshot:
+		r.electionElapsed = 0
+		r.Lead = m.From
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgRequestVote:
 		r.handleRequestVote(m)
 	}
@@ -527,7 +543,22 @@ func (r *Raft) handlePropose(m pb.Message) {
 
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
-	// Your Code Here (2C).
+	meta := m.Snapshot.Metadata
+	if m.Term < r.Term || meta.Index <= r.RaftLog.committed {
+		return
+	}
+	r.becomeFollower(m.Term, m.From)
+
+	r.RaftLog.committed = meta.Index
+	r.RaftLog.pendingSnapshot = m.Snapshot
+	r.RaftLog.applied = meta.Index
+	r.RaftLog.stabled = meta.Index
+	r.RaftLog.entries = []pb.Entry{{Index: meta.Index, Term: meta.Term}}
+
+	r.Prs = make(map[uint64]*Progress)
+	for _, id := range meta.ConfState.Nodes {
+		r.Prs[id] = &Progress{}
+	}
 }
 
 // addNode add a new node to raft group
