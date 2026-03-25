@@ -350,6 +350,8 @@ func (r *Raft) Step(m pb.Message) error {
 }
 func (r *Raft) stepLeader(m pb.Message) error {
 	switch m.MsgType {
+	case pb.MessageType_MsgTransferLeader:
+		r.handleLeaderTransfer(m.From)
 	case pb.MessageType_MsgBeat:
 		r.bcastHeartbeat()
 	case pb.MessageType_MsgPropose:
@@ -398,6 +400,11 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 
 func (r *Raft) stepFollower(m pb.Message) error {
 	switch m.MsgType {
+	case pb.MessageType_MsgTimeoutNow:
+		if r.promotable() {
+			r.becomeCandidate()
+			r.campaign()
+		}
 	case pb.MessageType_MsgHup:
 		r.becomeCandidate()
 		r.campaign()
@@ -415,6 +422,13 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		r.handleSnapshot(m)
 	case pb.MessageType_MsgRequestVote:
 		r.handleRequestVote(m)
+	case pb.MessageType_MsgTransferLeader:
+		if r.Lead == None {
+			log.Infof("%x no leader at term %d; dropping leader transfer msg", r.id, r.Term)
+			return nil
+		}
+		m.To = r.Lead
+		r.send(m)
 	}
 	return nil
 }
@@ -503,6 +517,9 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 	if r.maybeCommit() {
 		r.bcastAppend() // 把新 commitIndex 广播给所有 follower
 	}
+	if m.From == r.leadTransferee && r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+		r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgTimeoutNow})
+	}
 }
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -561,14 +578,52 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	}
 }
 
+// handle leader transfer
+func (r *Raft) handleLeaderTransfer(leaderTransferee uint64) {
+	// 判断 leadTransferee在不在 peer 里
+	if _, exists := r.Prs[leaderTransferee]; !exists {
+		// peer not found!
+		return
+	}
+	// 判断自己的 leadTransferee 是否为空，如果不为空，则说明已经有 Leader Transfer 在执行，忽略本次
+	if r.leadTransferee != None {
+		if r.leadTransferee == leaderTransferee {
+			return
+		}
+		lastLeadTransferee := r.leadTransferee
+		r.leadTransferee = None
+		log.Infof("%x [term %d] abort previous transferring leadership to %x", r.id, r.Term, lastLeadTransferee)
+	}
+	if leaderTransferee == r.id {
+		log.Debugf("%x is already leader. Ignored transferring leadership to self", r.id)
+		return
+	}
+
+	r.electionElapsed = 0
+	r.leadTransferee = leaderTransferee
+	if r.Prs[leaderTransferee].Match == r.RaftLog.LastIndex() {
+		r.send(pb.Message{To: leaderTransferee, MsgType: pb.MessageType_MsgTimeoutNow})
+	} else {
+		r.sendAppend(leaderTransferee)
+	}
+}
+
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	r.Prs[id] = &Progress{
+		Match: 0,
+		Next:  0,
+	}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	delete(r.Prs, id)
+	if r.id == r.Lead {
+		r.maybeCommit()
+	}
 }
 
 func (r *Raft) isSingleNode() bool {
@@ -602,6 +657,7 @@ func (r *Raft) reset(term uint64) {
 	}
 
 	r.votes = make(map[uint64]bool)
+	r.leadTransferee = None
 }
 
 func (r *Raft) bcastHeartbeat() {
@@ -726,4 +782,14 @@ func (r *Raft) hardState() pb.HardState {
 		Vote:   r.Vote,
 		Commit: r.RaftLog.committed,
 	}
+}
+
+// 是否可以升级为 leader ？需要满足两个条件：
+// 1. 自己在 progress 列表中
+// 2. 不是 learner 角色
+// promotable indicates whether state machine can be promoted to leader,
+// which is true when its own id is in progress list.
+func (r *Raft) promotable() bool {
+	pr := r.Prs[r.id]
+	return pr != nil
 }

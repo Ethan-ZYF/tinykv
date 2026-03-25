@@ -143,23 +143,24 @@ func (d *peerMsgHandler) handleProposals(entry eraftpb.Entry, resp *raft_cmdpb.R
 			d.proposals = d.proposals[1:]
 			continue
 		}
-		if p.index == entry.Index {
-			if p.term == entry.Term {
-				if p.cb != nil && resp != nil {
-					for _, r := range resp.Responses {
-						if r.CmdType == raft_cmdpb.CmdType_Snap {
-							p.cb.Txn = d.ctx.engine.Kv.NewTransaction(false)
-						}
-					}
-					p.cb.Done(resp)
-				}
-			} else {
-				if p.cb != nil {
-					NotifyStaleReq(entry.Term, p.cb)
+
+		if p.index > entry.Index {
+			break
+		}
+
+		// p.index == entry.Index
+		if p.term == entry.Term && p.cb != nil && resp != nil {
+			for _, r := range resp.Responses {
+				if r.CmdType == raft_cmdpb.CmdType_Snap {
+					p.cb.Txn = d.ctx.engine.Kv.NewTransaction(false)
 				}
 			}
-			d.proposals = d.proposals[1:]
+			p.cb.Done(resp)
+		} else if p.cb != nil {
+			NotifyStaleReq(entry.Term, p.cb)
 		}
+
+		d.proposals = d.proposals[1:]
 		break
 	}
 }
