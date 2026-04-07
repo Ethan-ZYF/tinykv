@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -146,8 +147,11 @@ func (rn *RawNode) Step(m pb.Message) error {
 		return ErrStepLocalMsg
 	}
 	if pr := rn.Raft.Prs[m.From]; pr != nil || !IsResponseMsg(m.MsgType) {
+		log.Debugf("[RawNode %d] Step %s from %d (term=%d, index=%d, commit=%d)",
+			rn.Raft.id, m.MsgType, m.From, m.Term, m.Index, m.Commit)
 		return rn.Raft.Step(m)
 	}
+	log.Debugf("[RawNode %d] Step drop %s from %d: peer not found", rn.Raft.id, m.MsgType, m.From)
 	return ErrStepPeerNotFound
 }
 
@@ -160,12 +164,14 @@ func (rn *RawNode) Ready() Ready {
 	ss := r.softState()
 	if ss.Lead != rn.prevSoftState.Lead || ss.RaftState != rn.prevSoftState.RaftState {
 		rd.SoftState = ss
+		log.Debugf("[RawNode %d] SoftState change: state=%s lead=%d", r.id, ss.RaftState, ss.Lead)
 	}
 
 	// 2. HardState：Term/Vote/Commit 变化了才填
 	hs := r.hardState()
 	if !isHardStateEqual(hs, rn.prevHardState) {
 		rd.HardState = hs
+		log.Debugf("[RawNode %d] HardState change: term=%d vote=%d commit=%d", r.id, hs.Term, hs.Vote, hs.Commit)
 	}
 
 	// 3. Entries：unstable entries，需要持久化
@@ -174,6 +180,8 @@ func (rn *RawNode) Ready() Ready {
 	// 4. Snapshot：待应用的快照（2C 再处理）
 	if !IsEmptySnap(r.RaftLog.pendingSnapshot) {
 		rd.Snapshot = *r.RaftLog.pendingSnapshot
+		log.Debugf("[RawNode %d] Ready snapshot index=%d term=%d",
+			r.id, rd.Snapshot.Metadata.Index, rd.Snapshot.Metadata.Term)
 	}
 
 	// 5. CommittedEntries：已提交但未 apply 的日志
@@ -181,6 +189,11 @@ func (rn *RawNode) Ready() Ready {
 
 	// 6. Messages：待发送的网络消息
 	rd.Messages = r.msgs
+
+	if len(rd.Entries) > 0 || len(rd.CommittedEntries) > 0 || len(rd.Messages) > 0 {
+		log.Debugf("[RawNode %d] Ready: unstableEntries=%d committedEntries=%d messages=%d",
+			r.id, len(rd.Entries), len(rd.CommittedEntries), len(rd.Messages))
+	}
 
 	return rd
 }
@@ -229,11 +242,13 @@ func (rn *RawNode) Advance(rd Ready) {
 	// 2. 推进 stabled（entries 已持久化）
 	if len(rd.Entries) > 0 {
 		e := rd.Entries[len(rd.Entries)-1]
+		log.Debugf("[RawNode %d] Advance stabled: %d -> %d", rn.Raft.id, rn.Raft.RaftLog.stabled, e.Index)
 		rn.Raft.RaftLog.stabled = e.Index
 	}
 	// 3. 推进 applied（committed entries 已应用）
 	if len(rd.CommittedEntries) > 0 {
 		e := rd.CommittedEntries[len(rd.CommittedEntries)-1]
+		log.Debugf("[RawNode %d] Advance applied: %d -> %d", rn.Raft.id, rn.Raft.RaftLog.applied, e.Index)
 		rn.Raft.RaftLog.applied = e.Index
 	}
 

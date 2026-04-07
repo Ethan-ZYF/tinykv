@@ -187,6 +187,14 @@ func (l *RaftLog) LastIndex() uint64 {
 	return 0
 }
 
+// LastTerm return the term of the last entry
+func (l *RaftLog) LastTerm() uint64 {
+	if len(l.entries) != 0 {
+		return l.entries[len(l.entries)-1].GetTerm()
+	}
+	return 0
+}
+
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	if !IsEmptySnap(l.pendingSnapshot) {

@@ -132,3 +132,24 @@ project4b:
 
 project4c:
 	$(GOTEST) ./kv/transaction/... -run 4C
+
+
+project3b-fail:
+	$(TEST_CLEAN)
+	$(GOTEST) ./kv/test_raftstore -run ^TestTransferLeader3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestBasicConfChange3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestConfChangeRemoveLeader3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestConfChangeRecover3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestConfChangeRecoverManyClients3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestConfChangeUnreliable3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestConfChangeUnreliableRecover3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestConfChangeSnapshotUnreliableRecover3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestConfChangeSnapshotUnreliableRecoverConcurrentPartition3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestOneSplit3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestSplitRecover3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestSplitRecoverManyClients3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestSplitUnreliable3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestSplitUnreliableRecover3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestSplitConfChangeSnapshotUnreliableRecover3B$ 
+	$(GOTEST) ./kv/test_raftstore -run ^TestSplitConfChangeSnapshotUnreliableRecoverConcurrentPartition3B$ 
+	$(TEST_CLEAN)

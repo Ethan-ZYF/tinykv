@@ -218,12 +218,10 @@ func (r *Raft) sendAppend(to uint64) bool {
 		return false
 	}
 
-	// 取 nextIndex 之后的所有 entries
 	nextIndex := r.Prs[to].Next
 	offset := r.RaftLog.FirstIndex()
 	entries := r.RaftLog.entries[nextIndex-offset:]
 
-	// []pb.Entry 转 []*pb.Entry
 	ents := make([]*pb.Entry, len(entries))
 	for i := range entries {
 		ents[i] = &entries[i]
@@ -268,6 +266,13 @@ func (r *Raft) tick() {
 			r.Step(pb.Message{
 				MsgType: pb.MessageType_MsgBeat,
 			})
+		}
+		if r.leadTransferee != None {
+			r.electionElapsed++
+			if r.electionElapsed >= r.electionTimeout {
+				r.electionElapsed = 0
+				r.leadTransferee = None
+			}
 		}
 	} else {
 		r.electionElapsed++
@@ -540,6 +545,9 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 }
 
 func (r *Raft) handlePropose(m pb.Message) {
+	if r.leadTransferee != None {
+		return // drop proposal while transferring
+	}
 	// 1. 把 entries 追加到本地 RaftLog
 	lastIndex := r.RaftLog.LastIndex()
 	for i, entry := range m.Entries {
@@ -576,6 +584,13 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	for _, id := range meta.ConfState.Nodes {
 		r.Prs[id] = &Progress{}
 	}
+
+	// Acknowledge the snapshot so the leader advances Match/Next for this peer.
+	r.send(pb.Message{
+		To:      m.From,
+		MsgType: pb.MessageType_MsgAppendResponse,
+		Index:   meta.Index,
+	})
 }
 
 // handle leader transfer
@@ -611,9 +626,12 @@ func (r *Raft) handleLeaderTransfer(leaderTransferee uint64) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	// Next=1 means prevLogIndex=0, which is before the log start.
+	// Term(0) returns ErrCompacted, causing sendAppend to send a snapshot
+	// so the new peer can catch up from scratch.
 	r.Prs[id] = &Progress{
 		Match: 0,
-		Next:  0,
+		Next:  1,
 	}
 }
 
