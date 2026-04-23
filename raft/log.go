@@ -179,6 +179,11 @@ func (l *RaftLog) commitTo(tocommit uint64) {
 	}
 }
 
+// Committed returns the committed index.
+func (l *RaftLog) Committed() uint64 {
+	return l.committed
+}
+
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	if len(l.entries) != 0 {

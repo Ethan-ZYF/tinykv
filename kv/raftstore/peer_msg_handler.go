@@ -198,18 +198,53 @@ func (d *peerMsgHandler) applyConfChange(entry eraftpb.Entry) {
 	// Get a mutable copy of the region to update peer list and epoch.
 	region := d.Region()
 
+	peerListChanged := false
 	if changePeer.ChangeType == eraftpb.ConfChangeType_AddNode {
-		// Add the new peer to the region and update the local peer cache
-		// so we can route messages to it.
-		region.Peers = append(region.Peers, changePeer.Peer)
-		d.insertPeerCache(changePeer.Peer)
+		// If exact same peer ID is already present, this is a duplicate committed entry
+		// (e.g. scheduler re-sent AddNode before the first one was visible). Treat it as
+		// a no-op: do not modify the peer list and do not bump ConfVer, since the
+		// scheduler requires ConfVer to increment by exactly 1 per visible peer-count change.
+		alreadyMember := false
+		for _, p := range region.Peers {
+			if p.Id == changePeer.Peer.Id {
+				alreadyMember = true
+				break
+			}
+		}
+		if alreadyMember {
+			log.Infof("%s applyConfChange SKIP duplicate AddNode peer %v (already member)", d.Tag, changePeer.Peer)
+		} else {
+			// Check if a different peer on the same store already exists (conflict).
+			for _, p := range region.Peers {
+				if p.StoreId == changePeer.Peer.StoreId {
+					log.Errorf("%s can't add duplicated peer %v to region %v", d.Tag, changePeer.Peer, region)
+					return
+				}
+			}
+			region.Peers = append(region.Peers, changePeer.Peer)
+			d.insertPeerCache(changePeer.Peer)
+			peerListChanged = true
+		}
 	} else {
-		// Remove the peer from the region's peer list.
-		for i, peer := range region.Peers {
-			if peer.Id == changePeer.Peer.Id {
+		// Find and remove the peer; validate it matches exactly.
+		found := false
+		for i, p := range region.Peers {
+			if p.Id == changePeer.Peer.Id {
+				found = true
 				region.Peers = append(region.Peers[:i], region.Peers[i+1:]...)
 				break
 			}
+		}
+		if !found {
+			// Duplicate committed RemoveNode (same peer removed by an earlier entry).
+			// Treat as a no-op: still advance AppliedIndex so progress isn't stalled.
+			log.Infof("%s applyConfChange SKIP duplicate RemoveNode peer %v (already removed)", d.Tag, changePeer.Peer)
+			kvWB := new(engine_util.WriteBatch)
+			d.peerStorage.applyState.AppliedIndex = entry.Index
+			kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			kvWB.WriteToDB(d.ctx.engine.Kv)
+			d.handleProposals(entry, nil)
+			return
 		}
 		// If we are the removed peer, destroy ourselves and stop.
 		if changePeer.Peer.Id == d.PeerId() {
@@ -222,10 +257,17 @@ func (d *peerMsgHandler) applyConfChange(entry eraftpb.Entry) {
 			return
 		}
 		d.removePeerCache(changePeer.Peer.Id)
+		peerListChanged = true
 	}
 
-	// Bump conf version to reflect the membership change.
-	region.RegionEpoch.ConfVer++
+	// Only bump ConfVer when the peer list actually changed. Duplicate committed entries
+	// (same peer ID added twice) must not inflate ConfVer, or the scheduler will see an
+	// epoch jump with an unchanged peer count and panic ("unmatched version").
+	if peerListChanged {
+		region.RegionEpoch.ConfVer++
+	}
+	log.Infof("%s applyConfChange EPOCH AFTER: confVer=%d version=%d peers=%v changed=%v",
+		d.Tag, region.RegionEpoch.ConfVer, region.RegionEpoch.Version, region.Peers, peerListChanged)
 
 	// Persist the updated region state and apply index atomically.
 	kvWB := new(engine_util.WriteBatch)
@@ -234,13 +276,18 @@ func (d *peerMsgHandler) applyConfChange(entry eraftpb.Entry) {
 	kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 	kvWB.WriteToDB(d.ctx.engine.Kv)
 
+	// Update peerStorage.region so d.Region() returns the new membership for proposal checks.
+	d.SetRegion(region)
+
 	// Update the in-memory region map so the router and snapshot checks stay consistent.
 	d.ctx.storeMeta.Lock()
 	d.ctx.storeMeta.regions[d.regionId] = region
 	d.ctx.storeMeta.Unlock()
 
 	// Tell the scheduler about the new region shape so it doesn't report "no region".
-	d.notifyHeartbeatScheduler(region, d.peer)
+	if peerListChanged {
+		d.notifyHeartbeatScheduler(region, d.peer)
+	}
 
 	// Respond to the original proposal callback.
 	resp := &raft_cmdpb.RaftCmdResponse{
@@ -375,32 +422,37 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			return
 		case raft_cmdpb.AdminCmdType_ChangePeer:
 			log.Infof("%s propose conf change %s\n", d.Tag, msg.AdminRequest.ChangePeer)
-			// changePeer := msg.AdminRequest.ChangePeer
-			// alreadyExists := false
-			// for _, p := range d.Region().Peers {
-			// 	if p.Id == changePeer.Peer.Id {
-			// 		alreadyExists = true
-			// 		break
-			// 	}
-			// }
-			// if changePeer.ChangeType == eraftpb.ConfChangeType_AddNode && alreadyExists {
-			// 	// peer already added, no-op
-			// 	if cb != nil {
-			// 		cb.Done(newCmdResp())
-			// 	}
-			// 	return
-			// }
-			// if changePeer.ChangeType == eraftpb.ConfChangeType_RemoveNode && !alreadyExists {
-			// 	// peer already removed, no-op
-			// 	if cb != nil {
-			// 		cb.Done(newCmdResp())
-			// 	}
-			// 	return
-			// }
+			changePeer := msg.AdminRequest.ChangePeer
+			// Reject if a conf change is already pending (not yet applied).
 			if d.RaftGroup.Raft.PendingConfIndex > d.peerStorage.AppliedIndex() {
-				// already a pending conf change, reject
+				log.Infof("%s REJECT conf change (pending): pendingConfIndex=%d appliedIndex=%d",
+					d.Tag, d.RaftGroup.Raft.PendingConfIndex, d.peerStorage.AppliedIndex())
 				if cb != nil {
 					cb.Done(ErrResp(errors.New("pending conf change")))
+				}
+				return
+			}
+			// Reject redundant adds and removes at proposal time.
+			peerExists := false
+			for _, p := range d.Region().Peers {
+				if p.Id == changePeer.Peer.Id {
+					peerExists = true
+					break
+				}
+			}
+			log.Infof("%s conf change %s: peerExists=%v currentPeers=%v",
+				d.Tag, msg.AdminRequest.ChangePeer, peerExists, d.Region().Peers)
+			if changePeer.ChangeType == eraftpb.ConfChangeType_AddNode && peerExists {
+				// Peer already a full member — no-op.
+				if cb != nil {
+					cb.Done(newCmdResp())
+				}
+				return
+			}
+			if changePeer.ChangeType == eraftpb.ConfChangeType_RemoveNode && !peerExists {
+				// Peer already gone — no-op.
+				if cb != nil {
+					cb.Done(newCmdResp())
 				}
 				return
 			}
@@ -890,6 +942,8 @@ func (d *peerMsgHandler) notifyHeartbeatScheduler(region *metapb.Region, peer *p
 	if err != nil {
 		return
 	}
+	log.Infof("%s sending heartbeat to scheduler: confVer=%d version=%d peerCount=%d",
+		peer.Tag, clonedRegion.RegionEpoch.ConfVer, clonedRegion.RegionEpoch.Version, len(clonedRegion.Peers))
 	d.ctx.schedulerTaskSender <- &runner.SchedulerRegionHeartbeatTask{
 		Region:          clonedRegion,
 		Peer:            peer.Meta,

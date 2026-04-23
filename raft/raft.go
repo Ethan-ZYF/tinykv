@@ -107,6 +107,10 @@ func (c *Config) validate() error {
 // progresses of all followers, and sends entries to the follower based on its progress.
 type Progress struct {
 	Match, Next uint64
+	// PendingSnapshot is true when a snapshot has been sent to this peer and we
+	// are waiting for an acknowledgement. While true, sendAppend skips this peer
+	// to avoid a snapshot storm.
+	PendingSnapshot bool
 }
 
 type Raft struct {
@@ -200,25 +204,35 @@ func newRaft(c *Config) *Raft {
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
-	prevLogIndex := r.Prs[to].Next - 1
+	pr := r.Prs[to]
+	// Don't send anything while a snapshot is in flight to avoid a snapshot
+	// storm. The pending flag is cleared when we get an AppendResponse.
+	if pr.PendingSnapshot {
+		return false
+	}
+	prevLogIndex := pr.Next - 1
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
 	if err == ErrCompacted {
 		snapshot, err := r.RaftLog.Snapshot()
 		if err != nil {
 			return false
 		}
+		// Patch the snapshot's ConfState to the latest configuration so
+		// the recipient knows the current membership immediately.
+		snapshot.Metadata.ConfState = &pb.ConfState{Nodes: nodes(r)}
 		r.send(
 			pb.Message{
 				MsgType:  pb.MessageType_MsgSnapshot,
 				To:       to,
 				Snapshot: &snapshot,
 			})
+		pr.PendingSnapshot = true
 		return true
 	} else if err != nil {
 		return false
 	}
 
-	nextIndex := r.Prs[to].Next
+	nextIndex := pr.Next
 	offset := r.RaftLog.FirstIndex()
 	entries := r.RaftLog.entries[nextIndex-offset:]
 
@@ -506,6 +520,8 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 }
 
 func (r *Raft) handleAppendResponse(m pb.Message) {
+	// Any AppendResponse (success or reject) means the snapshot was received.
+	r.Prs[m.From].PendingSnapshot = false
 	if m.Reject {
 		// 回退 nextIndex 重试
 		if r.Prs[m.From].Next > 0 {
@@ -538,6 +554,10 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 }
 
 func (r *Raft) handleHeartbeatResponse(m pb.Message) {
+	// A heartbeat response proves the peer is alive and reachable.
+	// Clear any stale PendingSnapshot so that sendAppend can retry delivering
+	// a snapshot that was lost (e.g. sent before the peer's store was ready).
+	r.Prs[m.From].PendingSnapshot = false
 	// 如果 follower 的 Match 落后，说明有日志需要补发
 	if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
 		r.sendAppend(m.From)
@@ -554,6 +574,11 @@ func (r *Raft) handlePropose(m pb.Message) {
 		entry.Term = r.Term
 		entry.Index = lastIndex + uint64(i) + 1
 		r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+		// Track the index of any pending conf-change so the upper layer can
+		// enforce the "at most one conf change in flight" invariant.
+		if entry.EntryType == pb.EntryType_EntryConfChange {
+			r.PendingConfIndex = entry.Index
+		}
 	}
 	// 2. 更新自己的 Prs
 	r.Prs[r.id].Match = r.RaftLog.LastIndex()
