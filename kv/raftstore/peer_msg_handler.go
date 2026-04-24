@@ -246,13 +246,23 @@ func (d *peerMsgHandler) applyConfChange(entry eraftpb.Entry) {
 			d.handleProposals(entry, nil)
 			return
 		}
-		// If we are the removed peer, destroy ourselves and stop.
+		// If we are the removed peer, broadcast a final heartbeat so
+		// followers can learn the latest commit index before we disappear.
+		// Then destroy ourselves.
 		if changePeer.Peer.Id == d.PeerId() {
 			kvWB := new(engine_util.WriteBatch)
 			d.peerStorage.applyState.AppliedIndex = entry.Index
 			kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 			meta.WriteRegionState(kvWB, region, rspb.PeerState_Tombstone)
 			kvWB.WriteToDB(d.ctx.engine.Kv)
+			// ApplyConfChange has already been called above, so Raft.Prs is
+			// updated. BcastHeartbeat will reach the remaining peers.
+			d.RaftGroup.Raft.BcastHeartbeat()
+			rd := d.RaftGroup.Ready()
+			if len(rd.Messages) != 0 {
+				d.Send(d.ctx.trans, rd.Messages)
+			}
+			d.RaftGroup.Advance(rd)
 			d.destroyPeer()
 			return
 		}

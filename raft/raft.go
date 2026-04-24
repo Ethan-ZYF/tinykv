@@ -372,7 +372,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 	case pb.MessageType_MsgTransferLeader:
 		r.handleLeaderTransfer(m.From)
 	case pb.MessageType_MsgBeat:
-		r.bcastHeartbeat()
+		r.BcastHeartbeat()
 	case pb.MessageType_MsgPropose:
 		// 追加日志，广播 MsgAppend
 		r.handlePropose(m)
@@ -703,7 +703,7 @@ func (r *Raft) reset(term uint64) {
 	r.leadTransferee = None
 }
 
-func (r *Raft) bcastHeartbeat() {
+func (r *Raft) BcastHeartbeat() {
 	for p := range r.Prs {
 		if p == r.id {
 			continue
@@ -806,6 +806,11 @@ func (r *Raft) maybeCommit() bool {
 		logTerm, _ := r.RaftLog.Term(newCommit)
 		if logTerm == r.Term {
 			r.RaftLog.committed = newCommit
+			// Once a conf change is committed it is no longer "in flight";
+			// allow the next conf change to be proposed immediately.
+			if r.PendingConfIndex > 0 && newCommit >= r.PendingConfIndex {
+				r.PendingConfIndex = 0
+			}
 			return true
 		}
 	}
