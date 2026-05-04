@@ -110,7 +110,8 @@ type Progress struct {
 	// PendingSnapshot is true when a snapshot has been sent to this peer and we
 	// are waiting for an acknowledgement. While true, sendAppend skips this peer
 	// to avoid a snapshot storm.
-	PendingSnapshot bool
+	PendingSnapshot        bool
+	PendingSnapshotElapsed int
 }
 
 type Raft struct {
@@ -225,8 +226,10 @@ func (r *Raft) sendAppend(to uint64) bool {
 				MsgType:  pb.MessageType_MsgSnapshot,
 				To:       to,
 				Snapshot: &snapshot,
-			})
+			},
+		)
 		pr.PendingSnapshot = true
+		pr.PendingSnapshotElapsed = 0
 		return true
 	} else if err != nil {
 		return false
@@ -254,8 +257,16 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
+	commit := r.RaftLog.committed
+	if pr, ok := r.Prs[to]; ok {
+		// A heartbeat is also how the leader tells followers about the latest
+		// commit index. Clamp it to the follower's matched index so we never ask
+		// it to commit entries it does not have locally yet.
+		commit = min(commit, pr.Match)
+	}
 	r.send(pb.Message{
 		To:      to,
+		Commit:  commit,
 		MsgType: pb.MessageType_MsgHeartbeat,
 	})
 }
@@ -274,6 +285,12 @@ func (r *Raft) sendRequestVote(to uint64, lastIndex uint64, lastTerm uint64) {
 func (r *Raft) tick() {
 	// Your Code Here (2A).
 	if r.State == StateLeader {
+		for id, pr := range r.Prs {
+			if id == r.id || !pr.PendingSnapshot {
+				continue
+			}
+			pr.PendingSnapshotElapsed++
+		}
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed == r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
@@ -522,10 +539,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 func (r *Raft) handleAppendResponse(m pb.Message) {
 	// Any AppendResponse (success or reject) means the snapshot was received.
 	r.Prs[m.From].PendingSnapshot = false
+	r.Prs[m.From].PendingSnapshotElapsed = 0
 	if m.Reject {
 		// 回退 nextIndex 重试
 		if r.Prs[m.From].Next > 0 {
-			r.Prs[m.From].Next--
+			r.Prs[m.From].Next = m.Index + 1
 		}
 		r.sendAppend(m.From)
 		return
@@ -558,6 +576,7 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	// Clear any stale PendingSnapshot so that sendAppend can retry delivering
 	// a snapshot that was lost (e.g. sent before the peer's store was ready).
 	r.Prs[m.From].PendingSnapshot = false
+	r.Prs[m.From].PendingSnapshotElapsed = 0
 	// 如果 follower 的 Match 落后，说明有日志需要补发
 	if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
 		r.sendAppend(m.From)
@@ -594,9 +613,18 @@ func (r *Raft) handlePropose(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	meta := m.Snapshot.Metadata
-	if m.Term < r.Term || meta.Index <= r.RaftLog.committed {
+	if m.Term < r.Term {
 		return
 	}
+	if meta.Index <= r.RaftLog.committed {
+		r.send(pb.Message{
+			To:      m.From,
+			MsgType: pb.MessageType_MsgAppendResponse,
+			Index:   r.RaftLog.LastIndex(),
+		})
+		return
+	}
+
 	r.becomeFollower(m.Term, m.From)
 
 	r.RaftLog.committed = meta.Index
@@ -610,7 +638,6 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		r.Prs[id] = &Progress{}
 	}
 
-	// Acknowledge the snapshot so the leader advances Match/Next for this peer.
 	r.send(pb.Message{
 		To:      m.From,
 		MsgType: pb.MessageType_MsgAppendResponse,
@@ -704,8 +731,14 @@ func (r *Raft) reset(term uint64) {
 }
 
 func (r *Raft) BcastHeartbeat() {
-	for p := range r.Prs {
+	for p, pr := range r.Prs {
 		if p == r.id {
+			continue
+		}
+		if pr.PendingSnapshot && pr.PendingSnapshotElapsed >= r.electionTimeout {
+			pr.PendingSnapshot = false
+			pr.PendingSnapshotElapsed = 0
+			r.sendAppend(p)
 			continue
 		}
 		r.sendHeartbeat(p)

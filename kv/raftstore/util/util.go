@@ -21,12 +21,17 @@ const InvalidID uint64 = 0
 // 1. Target peer already exists but has not established communication with leader yet
 // 2. Target peer is added newly due to member change or region split, but it's not
 //    created yet
-// For both cases the region start key and end key are attached in RequestVote and
-// Heartbeat message for the store of that peer to check whether to create a new peer
-// when receiving these messages, or just to wait for a pending region split to perform
-// later.
+// For both cases the region start key and end key are attached so the store can
+// decide whether it is safe to create the peer immediately, or whether it should
+// wait for an overlapping region/split to finish first.
+//
+// Snapshot messages must also be treated as initial messages. During conf change,
+// the leader may send a snapshot to the new peer before a heartbeat has created it
+// on the target store. If the store refuses to create the peer from that first
+// snapshot, the snapshot is effectively lost and the conf change can wedge.
 func IsInitialMsg(msg *eraftpb.Message) bool {
 	return msg.MsgType == eraftpb.MessageType_MsgRequestVote ||
+		msg.MsgType == eraftpb.MessageType_MsgSnapshot ||
 		// the peer has not been known to this leader, it may exist or not.
 		(msg.MsgType == eraftpb.MessageType_MsgHeartbeat && msg.Commit == RaftInvalidIndex)
 }

@@ -246,10 +246,12 @@ func (d *peerMsgHandler) applyConfChange(entry eraftpb.Entry) {
 			d.handleProposals(entry, nil)
 			return
 		}
+		peerListChanged = true
 		// If we are the removed peer, broadcast a final heartbeat so
 		// followers can learn the latest commit index before we disappear.
 		// Then destroy ourselves.
 		if changePeer.Peer.Id == d.PeerId() {
+			region.RegionEpoch.ConfVer++
 			kvWB := new(engine_util.WriteBatch)
 			d.peerStorage.applyState.AppliedIndex = entry.Index
 			kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
@@ -267,7 +269,6 @@ func (d *peerMsgHandler) applyConfChange(entry eraftpb.Entry) {
 			return
 		}
 		d.removePeerCache(changePeer.Peer.Id)
-		peerListChanged = true
 	}
 
 	// Only bump ConfVer when the peer list actually changed. Duplicate committed entries
@@ -463,6 +464,31 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				// Peer already gone — no-op.
 				if cb != nil {
 					cb.Done(newCmdResp())
+				}
+				return
+			}
+			if changePeer.ChangeType == eraftpb.ConfChangeType_RemoveNode &&
+				changePeer.Peer.Id == d.PeerId() &&
+				len(d.Region().Peers) == 2 {
+				for _, p := range d.Region().Peers {
+					if p.Id == d.PeerId() {
+						continue
+					}
+					log.Infof("%s transfer leader to %d before removing self from two-peer config",
+						d.Tag, p.Id)
+					d.RaftGroup.TransferLeader(p.Id)
+					if cb != nil {
+						cb.Done(ErrResp(errors.New("transferring leader before removing self")))
+					}
+					return
+				}
+			}
+			pendingPeers := d.CollectPendingPeers()
+			if len(pendingPeers) > 0 {
+				log.Infof("%s REJECT conf change (pending peers): %v",
+					d.Tag, pendingPeers)
+				if cb != nil {
+					cb.Done(ErrResp(errors.New("pending peer")))
 				}
 				return
 			}
